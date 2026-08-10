@@ -5,6 +5,7 @@
 
 #include "iree/compiler/GlobalOptimization/Passes.h"
 #include "iree/compiler/Dialect/Flow/Transforms/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/TensorExt/IR/TensorExtDialect.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
 #include "iree/compiler/DispatchCreation/Passes.h"
@@ -23,6 +24,13 @@ static llvm::cl::opt<bool> clEnableQuantizedMatmulReassociation(
     "iree-global-opt-enable-quantized-matmul-reassociation",
     llvm::cl::desc(
         "Enables reassociation of quantized matmul ops (experimental)."),
+    llvm::cl::init(false));
+static llvm::cl::opt<bool> clConvertQDQToIntegerMath(
+    "iree-global-opt-enable-qdq-to-integer-math",
+    llvm::cl::desc(
+        "Rewrites contractions over dequantized operands into "
+        "integer contractions with zero point corrections (experimental; "
+        "changes floating-point rounding)."),
     llvm::cl::init(false));
 static llvm::cl::opt<bool> clEnableTransposePropagation(
     "iree-global-opt-propagate-transposes",
@@ -200,6 +208,17 @@ void buildGlobalOptimizationPassPipeline(
                                clEnableEdgeReshapePropagation;
                            return createPropagateLinalgTransposePass(options);
                          })
+      // Match direct dequantize producers after reshape/transpose propagation,
+      // before encoding selection chooses layouts for the integer contraction.
+      .addPredicatedPass(clConvertQDQToIntegerMath,
+                         createConvertQDQToIntegerMathPass)
+      // Lower remaining quantization ops even when the integer rewrite is off.
+      .addPass([&]() {
+        IREE::LinalgExt::DecomposeAggregatedOpPassOptions options;
+        options.filterOps = "iree_linalg_ext.quantize_affine,"
+                            "iree_linalg_ext.dequantize_affine";
+        return IREE::LinalgExt::createDecomposeAggregatedOpPass(options);
+      })
       .addPass(IREE::Flow::createCanonicalizePass)
       .addPass(mlir::createCSEPass);
   mainPassManager.addPass(
