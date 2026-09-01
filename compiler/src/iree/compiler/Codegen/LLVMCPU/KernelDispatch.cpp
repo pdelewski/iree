@@ -89,6 +89,22 @@ static llvm::cl::opt<int>
                           llvm::cl::desc("default distribution tile size"),
                           llvm::cl::init(64));
 
+// mlir-obs experiment (patches/iree-0002): bound the contraction
+// distribution tiles by the per-workgroup operand working set. The
+// existing heuristic copies distribution tiles into the cache level as a
+// declared no-op (see the TODO in setContractionRootConfig) and sizes
+// them without looking at the untiled reduction extent, so a [64,64]
+// tile at K=1024/f32 drags ~512KB of operands per workgroup and
+// thrashes the per-core cache (measured 1.86x on a 1024^3 matmul,
+// mlir-obs demo 18). Budget default chosen empirically for this machine
+// class; 0 disables the adjustment (the A/B switch). The upstream form
+// should derive the budget from target cache attributes.
+static llvm::cl::opt<int64_t> clMatmulWorkingSetBudget(
+    "iree-llvmcpu-matmul-working-set-budget",
+    llvm::cl::desc("Per-workgroup operand working-set budget in bytes used "
+                   "to bound contraction distribution tiles (0 = disabled)"),
+    llvm::cl::init(196608));
+
 static llvm::cl::opt<int> clMatmulTileBytes(
     "iree-llvmcpu-matmul-tile-bytes",
     llvm::cl::desc(
@@ -1680,6 +1696,52 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
   }
   SmallVector<int64_t> distTileSizes =
       getDefaultDistributedLevelTileSizes(linalgOp, distConfig);
+
+  // mlir-obs iree-0002: bound the per-workgroup operand working set.
+  // With the cache level being a declared no-op below, the distribution
+  // tile IS the cache tile; account for the (untiled) reduction extent
+  // when sizing it. Only fires on static shapes whose working set
+  // exceeds the budget — small-K contractions are untouched.
+  if (clMatmulWorkingSetBudget > 0) {
+    SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
+    int64_t kExtent = ranges.back();
+    unsigned mIdx = isBM ? 1 : 0;
+    unsigned nIdx = isBM ? 2 : 1;
+    if (!ShapedType::isDynamic(kExtent) && ranges.size() >= 2 &&
+        !ShapedType::isDynamic(ranges[mIdx]) &&
+        !ShapedType::isDynamic(ranges[nIdx])) {
+      int64_t eltBytes =
+          std::max<int64_t>(1, lhsShapedType.getElementTypeBitWidth() / 8);
+      auto effTile = [&](unsigned idx) {
+        return distTileSizes[idx] == 0 ? ranges[idx] : distTileSizes[idx];
+      };
+      auto workingSet = [&]() {
+        int64_t m = effTile(mIdx), n = effTile(nIdx);
+        return (m * kExtent + kExtent * n + m * n) * eltBytes;
+      };
+      auto minFor = [&](unsigned idx) {
+        return distConfig.minTileSizes.empty()
+                   ? 1
+                   : std::max<int64_t>(1, distConfig.minTileSizes[idx]);
+      };
+      while (workingSet() > clMatmulWorkingSetBudget) {
+        unsigned victim = effTile(mIdx) >= effTile(nIdx) ? mIdx : nIdx;
+        int64_t cur = effTile(victim);
+        int64_t next = std::max(minFor(victim), cur / 2);
+        if (next == cur) {
+          // Try the other dim once before giving up.
+          victim = victim == mIdx ? nIdx : mIdx;
+          cur = effTile(victim);
+          next = std::max(minFor(victim), cur / 2);
+          if (next == cur)
+            break;
+        }
+        distTileSizes[victim] = next;
+      }
+      LDBG() << "Working-set bounded distribution tile sizes: "
+             << distTileSizes;
+    }
+  }
 
   // TODO: We set cache tile sizes to the distribution sizes for now (no-op) to
   // make sure there are no performance changes. This will let us change the
