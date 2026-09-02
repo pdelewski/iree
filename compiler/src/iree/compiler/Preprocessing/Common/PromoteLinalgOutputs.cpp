@@ -123,7 +123,12 @@ struct PromoteLinalgOutputsPattern
           replaceOpOutputs(op, rewriter, srcType, destType);
           return success();
         })
-        .Default(failure);
+        // Call it rather than passing it: `failure` as a callable decays to
+        // a function pointer, and default arguments are a property of the
+        // declaration at the call site, not of the function type -- so a
+        // pointer call must pass every parameter. TypeSwitch has a
+        // value-taking Default overload, which is what was meant anyway.
+        .Default(failure());
   }
 
 private:
