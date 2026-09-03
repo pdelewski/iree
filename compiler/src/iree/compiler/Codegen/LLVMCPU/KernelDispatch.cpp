@@ -48,6 +48,7 @@
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Remarks.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -4271,6 +4272,38 @@ setTranslationInfoAndRootConfig(mlir::FunctionOpInterface entryPointFn,
                                               rootOperation))) {
       return failure();
     }
+  }
+
+  // State the choice, read back from what was just committed: the pipeline,
+  // the root's lowering config verbatim, and the root's static loop ranges.
+  // The ranges are what let a reader judge the tile sizes against the
+  // iteration space (a fixed distribution tile beside an unconsulted
+  // reduction extent is a finding, not a curiosity). Costs a pointer check
+  // unless a remark engine is installed.
+  if (IREE::Codegen::TranslationInfoAttr chosen =
+          getTranslationInfo(entryPointFn)) {
+    std::string cfgStr;
+    if (auto cfg = getLoweringConfig(rootOperation)) {
+      llvm::raw_string_ostream os(cfgStr);
+      cfg.print(os);
+    }
+    std::string rangesStr;
+    if (auto linalgRoot = dyn_cast<linalg::LinalgOp>(rootOperation)) {
+      llvm::raw_string_ostream os(rangesStr);
+      llvm::interleaveComma(linalgRoot.getStaticLoopRanges(), os);
+    }
+    std::string pipelineStr;
+    {
+      llvm::raw_string_ostream os(pipelineStr);
+      os << chosen.getPassPipeline();
+    }
+    remark::passed(rootOperation->getLoc(),
+                   remark::RemarkOpts::name("lowering-config")
+                       .category("LoweringConfig"))
+        << remark::reason("pipeline {0} for root {1}", pipelineStr,
+                          rootOperation->getName().getStringRef())
+        << remark::metric("config", cfgStr)
+        << remark::metric("loopRanges", rangesStr);
   }
 
   return success();
