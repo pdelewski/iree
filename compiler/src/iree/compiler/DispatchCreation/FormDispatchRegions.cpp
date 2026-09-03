@@ -407,9 +407,8 @@ getFusableUses(MLIRContext *context, Operation *op,
     }
     if (consumers.size() != 1) {
       if (consumers.size() > 1) {
-        remark::missed(op->getLoc(),
-                       remark::RemarkOpts::name("fuse-with-consumer")
-                           .category("DispatchFormation"))
+        remark::missed(op, remark::RemarkOpts::name("fuse-with-consumer")
+                                   .category("DispatchFormation"))
             << remark::reason("producer has {0} consumers; non-aggressive "
                               "fusion requires exactly one (multi-use "
                               "conservatism)",
@@ -495,9 +494,8 @@ static bool canUseInOperandAsInitOperand(OpOperand *inOperand,
 static bool declinedFusion(OpOperand &fusedOperand, const char *reason) {
   Operation *consumer = fusedOperand.getOwner();
   Operation *producer = fusedOperand.get().getDefiningOp();
-  remark::missed(consumer->getLoc(),
-                 remark::RemarkOpts::name("fuse-with-consumer")
-                     .category("DispatchFormation"))
+  remark::missed(consumer, remark::RemarkOpts::name("fuse-with-consumer")
+                                   .category("DispatchFormation"))
       << remark::reason("{0}", reason)
       << remark::metric("producer", producer->getName().getStringRef())
       << remark::metric("consumer", consumer->getName().getStringRef());

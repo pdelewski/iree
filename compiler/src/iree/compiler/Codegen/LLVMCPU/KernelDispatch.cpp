@@ -4186,7 +4186,7 @@ lowerUsingDefaultPipeline(mlir::FunctionOpInterface entryPointFn) {
   // tiling or vectorization strategy was ever selected. Without this remark
   // the absence reads as the vectorizer refusing, which is a different
   // (and wrong) story.
-  remark::passed(entryPointFn->getLoc(),
+  remark::passed(entryPointFn.getOperation(),
                  remark::RemarkOpts::name("lowering-config")
                      .category("LoweringConfig"))
       << remark::reason("no root operation identified; falling back to the "
@@ -4308,7 +4308,7 @@ setTranslationInfoAndRootConfig(mlir::FunctionOpInterface entryPointFn,
       llvm::raw_string_ostream os(pipelineStr);
       os << chosen.getPassPipeline();
     }
-    remark::passed(rootOperation->getLoc(),
+    remark::passed(rootOperation,
                    remark::RemarkOpts::name("lowering-config")
                        .category("LoweringConfig"))
         << remark::reason("pipeline {0} for root {1}", pipelineStr,

@@ -187,9 +187,8 @@ public:
 /// is installed.
 static void declinedVectorization(Operation *op, const llvm::Twine &reason) {
   std::string text = reason.str();
-  mlir::remark::missed(op->getLoc(),
-                       mlir::remark::RemarkOpts::name("vectorize")
-                           .category("Vectorization"))
+  mlir::remark::missed(op, mlir::remark::RemarkOpts::name("vectorize")
+                                   .category("Vectorization"))
       << mlir::remark::reason("{0}", text)
       << mlir::remark::metric("op", op->getName().getStringRef());
 }
