@@ -15,6 +15,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
+#include "mlir/IR/Remarks.h"
 #include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -179,6 +180,20 @@ public:
   void runOnOperation() override;
 };
 
+
+/// States a driver-level vectorization refusal (mlir::remark, category
+/// "Vectorization"): the walk skipped this candidate before upstream
+/// vectorize() could speak. Costs a pointer check unless a remark engine
+/// is installed.
+static void declinedVectorization(Operation *op, const llvm::Twine &reason) {
+  std::string text = reason.str();
+  mlir::remark::missed(op->getLoc(),
+                       mlir::remark::RemarkOpts::name("vectorize")
+                           .category("Vectorization"))
+      << mlir::remark::reason("{0}", text)
+      << mlir::remark::metric("op", op->getName().getStringRef());
+}
+
 void GenericVectorizationPass::runOnOperation() {
   MLIRContext *context = &getContext();
   mlir::FunctionOpInterface funcOp = getOperation();
@@ -237,10 +252,17 @@ void GenericVectorizationPass::runOnOperation() {
       // to limit.
       if (enableVectorMasking) {
         if (llvm::product_of(vectorSizes) >= maxVectorSize) {
+          declinedVectorization(op, "vector size product " +
+                                        llvm::Twine(llvm::product_of(
+                                            vectorSizes)) +
+                                        " exceeds max-vector-size " +
+                                        llvm::Twine(maxVectorSize));
           continue;
         }
       } else {
         if (failed(isWithinVectorSizeLimit(linalgOp, maxVectorSize))) {
+          declinedVectorization(op, "op exceeds the max-vector-size limit " +
+                                        llvm::Twine(maxVectorSize));
           continue;
         }
       }
@@ -250,6 +272,7 @@ void GenericVectorizationPass::runOnOperation() {
 
     if (!vectorizableOp.isVectorizable(vectorSizes, scalableVecDims,
                                        linalgOptions)) {
+      declinedVectorization(op, "isVectorizable refused (preconditions)");
       continue;
     }
 
@@ -258,6 +281,8 @@ void GenericVectorizationPass::runOnOperation() {
     if (failed(result)) {
       LDBG() << "vectorize() failed after isVectorizable() returned true: "
              << *op;
+      declinedVectorization(
+          op, "vectorize() failed after isVectorizable() returned true");
       continue;
     }
     rewriter.replaceOp(op, *result);

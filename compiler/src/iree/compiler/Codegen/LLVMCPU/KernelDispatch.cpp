@@ -4181,6 +4181,17 @@ lowerUsingDefaultPipeline(mlir::FunctionOpInterface entryPointFn) {
   // Otherwise lower using default pipeline.
   IREE::Codegen::TranslationInfoAttr translationInfo =
       getCPUTranslationInfo(entryPointFn->getContext(), CPUPipeline::Default);
+  // State the fallback: this is the choice that explains every kernel with
+  // "no vector config recorded" -- no root operation was identified, so no
+  // tiling or vectorization strategy was ever selected. Without this remark
+  // the absence reads as the vectorizer refusing, which is a different
+  // (and wrong) story.
+  remark::passed(entryPointFn->getLoc(),
+                 remark::RemarkOpts::name("lowering-config")
+                     .category("LoweringConfig"))
+      << remark::reason("no root operation identified; falling back to the "
+                        "default pipeline (no tiling or vectorization "
+                        "strategy selected)");
   return setTranslationInfo(entryPointFn, translationInfo);
 }
 
