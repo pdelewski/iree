@@ -39,6 +39,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Remarks.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/TilingInterface.h"
@@ -405,6 +406,16 @@ getFusableUses(MLIRContext *context, Operation *op,
       }
     }
     if (consumers.size() != 1) {
+      if (consumers.size() > 1) {
+        remark::missed(op->getLoc(),
+                       remark::RemarkOpts::name("fuse-with-consumer")
+                           .category("DispatchFormation"))
+            << remark::reason("producer has {0} consumers; non-aggressive "
+                              "fusion requires exactly one (multi-use "
+                              "conservatism)",
+                              consumers.size())
+            << remark::metric("producer", op->getName().getStringRef());
+      }
       return {};
     }
   }
@@ -477,6 +488,22 @@ static bool canUseInOperandAsInitOperand(OpOperand *inOperand,
   return true;
 }
 
+/// Records a stated decline for one considered fusion edge, through
+/// mlir::remark (category "DispatchFormation"). Costs a pointer check unless
+/// a remark engine is installed on the context. Returns false so a decision
+/// site reads `return declinedFusion(operand, "why");`.
+static bool declinedFusion(OpOperand &fusedOperand, const char *reason) {
+  Operation *consumer = fusedOperand.getOwner();
+  Operation *producer = fusedOperand.get().getDefiningOp();
+  remark::missed(consumer->getLoc(),
+                 remark::RemarkOpts::name("fuse-with-consumer")
+                     .category("DispatchFormation"))
+      << remark::reason("{0}", reason)
+      << remark::metric("producer", producer->getName().getStringRef())
+      << remark::metric("consumer", consumer->getName().getStringRef());
+  return false;
+}
+
 /// Returns true if this is a fusable use, while fusing a root with its
 /// consumer.
 static bool
@@ -490,7 +517,8 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   IREE::Flow::CloneableIntoDispatchOptions cloneableOptions;
   cloneableOptions.aggressive = options.aggressiveFusion;
   if (IREE::Flow::isCloneableIntoDispatchOp(consumer, cloneableOptions)) {
-    return false;
+    return declinedFusion(fusedOperand, "consumer is cloneable into a "
+                                        "dispatch; it is cloned, not fused");
   }
 
   // Fuse unset_encoding operations with `tensor.extract_slice` and elementwise
@@ -502,25 +530,42 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
       if (hasNoPackedReductionDimensions(consumerLinalgOp, producer)) {
         return true;
       }
-      return linalg::isElementwise(consumerLinalgOp) &&
-             consumerLinalgOp.getNumLoops() ==
-                 cast<RankedTensorType>(producer->getResult(0).getType())
-                     .getRank();
+      if (linalg::isElementwise(consumerLinalgOp) &&
+          consumerLinalgOp.getNumLoops() ==
+              cast<RankedTensorType>(producer->getResult(0).getType())
+                  .getRank()) {
+        return true;
+      }
+      return declinedFusion(fusedOperand,
+                            "unpack-like producer: consumer is neither "
+                            "packed-reduction-free nor an elementwise op of "
+                            "the producer's rank");
     }
-    return false;
+    return declinedFusion(fusedOperand,
+                          "unpack-like producer: consumer is not a linalg op");
   }
 
   if (isPackLikeOp(consumer)) {
-    return TypeSwitch<Operation *, bool>(producer)
-        .Case([&](tensor::PadOp padOp) { return true; })
-        .Case([&](linalg::LinalgOp linalgOp) {
-          AffineMap producerIndexingMap = linalgOp.getIndexingMapMatchingResult(
-              cast<OpResult>(fusedOperand.get()));
-          // Make sure the producer op has an identity result indexing map. As
-          // CPU backend currently can't handle transpose between fused ops.
-          return producerIndexingMap.isIdentity();
-        })
-        .Default(false);
+    bool fusable =
+        TypeSwitch<Operation *, bool>(producer)
+            .Case([&](tensor::PadOp padOp) { return true; })
+            .Case([&](linalg::LinalgOp linalgOp) {
+              AffineMap producerIndexingMap =
+                  linalgOp.getIndexingMapMatchingResult(
+                      cast<OpResult>(fusedOperand.get()));
+              // Make sure the producer op has an identity result indexing
+              // map. As CPU backend currently can't handle transpose between
+              // fused ops.
+              return producerIndexingMap.isIdentity();
+            })
+            .Default(false);
+    if (!fusable) {
+      return declinedFusion(fusedOperand,
+                            "pack-like consumer: producer is neither a pad "
+                            "nor a linalg op with an identity result map "
+                            "(CPU backend cannot fuse through a transpose)");
+    }
+    return true;
   }
 
   // By default, padding should be fused with producers. It is hard to square
@@ -528,9 +573,15 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   // Either fuse pad with producer or with consumer.
   if (auto padOp = dyn_cast<tensor::PadOp>(consumer)) {
     if (options.fusePadWithProducers) {
-      return isa<linalg::LinalgOp>(producer);
+      if (isa<linalg::LinalgOp>(producer)) {
+        return true;
+      }
+      return declinedFusion(fusedOperand,
+                            "pad consumer: producer is not a linalg op");
     }
-    return false;
+    return declinedFusion(fusedOperand,
+                          "pad consumer: pad fuses with its own producers "
+                          "(fuse-pad-with-producers is off for consumers)");
   }
 
   // Insert slice ops should always be fused with their producers.
@@ -538,19 +589,28 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
     // TODO: Enable multi-use slice source fusion.
     Value source = insertSliceOp.getSource();
     if (!source.hasOneUse() || source.getDefiningOp() != producer) {
-      return false;
+      return declinedFusion(fusedOperand,
+                            "insert_slice consumer: source has other uses or "
+                            "is not this producer");
     }
     // Fuse in `insert_slice` consumer operations if destination is a fill.
     // TODO: This can be generalized, but destination cannot be a
     // `arith.constant` or other constant-like objects. `linalg.fill` captures a
     // common case of pad generalization.
-    return insertSliceOp.getDest().getDefiningOp<linalg::FillOp>();
+    if (insertSliceOp.getDest().getDefiningOp<linalg::FillOp>()) {
+      return true;
+    }
+    return declinedFusion(fusedOperand,
+                          "insert_slice consumer: destination is not a "
+                          "linalg.fill");
   }
 
   // TODO(#16025): Enable mmt4d fusion. It is disabled because the backends
   // can not set multi lowering_config properly. See the issue for more details.
   if (isa<linalg::Mmt4DOp, linalg::BatchMmt4DOp>(producer)) {
-    return false;
+    return declinedFusion(fusedOperand,
+                          "mmt4d producer: fusion disabled, backends cannot "
+                          "set multiple lowering configs (#16025)");
   }
 
   auto producerFusionOp =
@@ -558,22 +618,29 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
   auto consumerFusionOp =
       dyn_cast<IREE::LinalgExt::LinalgFusionOpInterface>(consumer);
   if (!producerFusionOp || !consumerFusionOp) {
-    return false;
+    return declinedFusion(fusedOperand,
+                          "producer or consumer does not implement the "
+                          "linalg fusion interface");
   }
 
   // Check that the consumer is all parallel.
   if (consumerFusionOp.getNumLoops() !=
       consumerFusionOp.getNumParallelLoops()) {
-    return false;
+    return declinedFusion(fusedOperand,
+                          "consumer has reduction loops; only all-parallel "
+                          "consumers fuse");
   }
 
   if (!tracker.getFusionGroup(producer).isFusable(consumer)) {
-    return false;
+    return declinedFusion(fusedOperand,
+                          "the producer's fusion group rejects this "
+                          "consumer");
   }
 
   // Check operand limit before allowing fusion
   if (tracker.getFusionGroup(producer).wouldExceedOperandLimit(consumer)) {
-    return false;
+    return declinedFusion(fusedOperand,
+                          "fusing would exceed the dispatch operand limit");
   }
 
   // Check if the iteration spaces of the producer and consumer are same.
@@ -585,7 +652,9 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
     SmallVector<int64_t> consumerIterationSpace =
         consumerFusionOp.getStaticLoopRanges();
     if (producerIterationSpace.size() < consumerIterationSpace.size()) {
-      return false;
+      return declinedFusion(fusedOperand,
+                            "producer iteration space is smaller than the "
+                            "consumer's; needs aggressive fusion (#12664)");
     }
   }
 
@@ -605,7 +674,9 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
     };
     if (countNonUnitDims(consumerLoopRanges) >
         countNonUnitDims(rootLoopRanges)) {
-      return false;
+      return declinedFusion(fusedOperand,
+                            "consumer has more non-unit loops than the "
+                            "fusion group root (broadcast blow-up)");
     }
   }
 
@@ -633,7 +704,9 @@ isFusableWithConsumer(OpOperand &fusedOperand, const FusionTracker &tracker,
             consumerDstOp.getDpsInitsMutable(), [&](OpOperand &initOperand) {
               return canUseInOperandAsInitOperand(inputOperand, &initOperand);
             })) {
-      return false;
+      return declinedFusion(fusedOperand,
+                            "convolution producer would need a stack "
+                            "allocation to bufferize in this dispatch");
     }
   }
 
