@@ -12,6 +12,7 @@
 #include "iree/compiler/DispatchCreation/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/Remarks.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LLVM.h"
@@ -75,6 +76,41 @@ static bool hasMatmulLikeBody(linalg::LinalgOp linalgOp) {
   return true;
 }
 
+/// Records a stated decline for one data-tiling candidate, through
+/// mlir::remark (category "DataTiling"). Costs a pointer check unless a
+/// remark engine is installed. The site metric is the compiler line that
+/// refused: __builtin_FILE/__builtin_LINE are default arguments, so they
+/// are evaluated at the caller — the decision site names itself without
+/// any hook. Ops with no reduction loop (fills, elementwise) never wanted
+/// data tiling and stay silent; anything else is a would-be candidate and
+/// its refusal is stated. Returns false so a decision site reads
+/// `return declinedDataTiling(op, "why");`.
+static bool declinedDataTiling(linalg::LinalgOp linalgOp, const char *reason,
+                               const char *file = __builtin_FILE(),
+                               unsigned line = __builtin_LINE()) {
+  if (linalgOp.getNumReductionLoops() == 0) {
+    return false;
+  }
+  // Trim the build-machine path to the source-root marker so the record
+  // joins to a source tree by a path that is the same on every machine.
+  StringRef site(file);
+  // find, not rfind: the tree nests iree/compiler twice
+  // (iree/compiler/src/iree/compiler/...), and the outer one is the path
+  // that resolves against a checkout root.
+  size_t at = site.find("/iree/compiler/");
+  if (at != StringRef::npos) {
+    site = site.drop_front(at + 1);
+  }
+  remark::missed(linalgOp.getOperation(),
+                 remark::RemarkOpts::name("data-tiling-hint")
+                     .category("DataTiling"))
+      << remark::reason("{0}", reason)
+      << remark::metric("op", linalgOp->getName().getStringRef())
+      << remark::metric("site",
+                        (llvm::Twine(site) + ":" + llvm::Twine(line)).str());
+  return false;
+}
+
 /// Common pre-conditions for data tiling. Return true if:
 ///   1) linalgOp has pure tensor semantics.
 ///   2) linalgOp does not have a preset compilation info.
@@ -121,21 +157,35 @@ static bool dataTilablePreCondition(linalg::LinalgOp linalgOp) {
 /// can support more cases.
 static bool isSupportedContractionOp(linalg::LinalgOp linalgOp) {
   if (!dataTilablePreCondition(linalgOp)) {
-    return false;
+    return declinedDataTiling(
+        linalgOp, "fails data-tiling preconditions: needs pure tensor "
+                  "semantics, no preset compilation info, no workgroup "
+                  "count, and operands without existing encodings");
   }
   if (!linalg::isaContractionOpInterface(linalgOp)) {
-    return false;
+    return declinedDataTiling(
+        linalgOp, "not a contraction: the indexing maps or body do not "
+                  "form a matmul-like multiply-accumulate");
   }
   auto cDims = linalg::inferContractionDims(linalgOp);
   if (failed(cDims) || cDims->batch.size() > 1 || cDims->m.size() > 1 ||
       cDims->n.size() > 1 || cDims->k.size() > 1) {
-    return false;
+    return declinedDataTiling(
+        linalgOp, "contraction has repeated dimensions: at most one batch, "
+                  "M, N and K dimension is supported (#16176)");
   }
   if ((cDims->n.empty() && cDims->m.empty()) || cDims->k.empty()) {
-    return false;
+    return declinedDataTiling(
+        linalgOp, "contraction is missing an M or N dimension, or a K "
+                  "dimension");
   }
   if (!hasMatmulLikeBody(linalgOp)) {
-    return false;
+    return declinedDataTiling(
+        linalgOp, "body is not the plain multiply-accumulate "
+                  "yield(add(out, mul(cast(a), cast(b)))): a cast after "
+                  "the multiply, a scale inside the body, or a non-add "
+                  "accumulator all fail here; data tiling rewrites to "
+                  "mmt4d and requires the plain form");
   }
   return true;
 }
