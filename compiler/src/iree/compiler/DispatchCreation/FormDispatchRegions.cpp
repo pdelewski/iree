@@ -21,6 +21,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/ADT/Twine.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -49,6 +50,22 @@
 #include "mlir/Transforms/RegionUtils.h"
 
 #define DEBUG_TYPE "iree-dispatch-creation-form-dispatch-regions"
+
+/// The decision site's own address for the record, as `<path>:<line>` with
+/// the build path trimmed at the source-root marker so the same site reads
+/// the same on every machine (mlir-obs D1). Default arguments are evaluated
+/// at the CALLER: a helper that forwards its own defaulted file/line names
+/// the site that called it, an inline use names itself.
+static std::string statedSite(const char *file = __builtin_FILE(),
+                              unsigned line = __builtin_LINE()) {
+  llvm::StringRef site(file);
+  // find, not rfind: the tree can nest the marker twice, and the outer one
+  // is the path that resolves against a checkout root.
+  size_t at = site.find("/iree/compiler/");
+  if (at != llvm::StringRef::npos)
+    site = site.drop_front(at + 1);
+  return (llvm::Twine(site) + ":" + llvm::Twine(line)).str();
+}
 
 namespace mlir::iree_compiler::DispatchCreation {
 
@@ -413,7 +430,8 @@ getFusableUses(MLIRContext *context, Operation *op,
                               "fusion requires exactly one (multi-use "
                               "conservatism)",
                               consumers.size())
-            << remark::metric("producer", op->getName().getStringRef());
+            << remark::metric("producer", op->getName().getStringRef())
+            << remark::metric("site", statedSite());
       }
       return {};
     }
@@ -491,14 +509,17 @@ static bool canUseInOperandAsInitOperand(OpOperand *inOperand,
 /// mlir::remark (category "DispatchFormation"). Costs a pointer check unless
 /// a remark engine is installed on the context. Returns false so a decision
 /// site reads `return declinedFusion(operand, "why");`.
-static bool declinedFusion(OpOperand &fusedOperand, const char *reason) {
+static bool declinedFusion(OpOperand &fusedOperand, const char *reason,
+                           const char *file = __builtin_FILE(),
+                           unsigned line = __builtin_LINE()) {
   Operation *consumer = fusedOperand.getOwner();
   Operation *producer = fusedOperand.get().getDefiningOp();
   remark::missed(consumer, remark::RemarkOpts::name("fuse-with-consumer")
                                    .category("DispatchFormation"))
       << remark::reason("{0}", reason)
       << remark::metric("producer", producer->getName().getStringRef())
-      << remark::metric("consumer", consumer->getName().getStringRef());
+      << remark::metric("consumer", consumer->getName().getStringRef())
+      << remark::metric("site", statedSite(file, line));
   return false;
 }
 

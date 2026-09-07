@@ -14,6 +14,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/Im2colUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "llvm/Support/DebugLog.h"
+#include "llvm/ADT/Twine.h"
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/IR/Remarks.h"
 #include "mlir/Dialect/Linalg/Transforms/Hoisting.h"
@@ -26,6 +27,22 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-codegen-generic-vectorization"
+
+/// The decision site's own address for the record, as `<path>:<line>` with
+/// the build path trimmed at the source-root marker so the same site reads
+/// the same on every machine (mlir-obs D1). Default arguments are evaluated
+/// at the CALLER: a helper that forwards its own defaulted file/line names
+/// the site that called it, an inline use names itself.
+static std::string statedSite(const char *file = __builtin_FILE(),
+                              unsigned line = __builtin_LINE()) {
+  llvm::StringRef site(file);
+  // find, not rfind: the tree can nest the marker twice, and the outer one
+  // is the path that resolves against a checkout root.
+  size_t at = site.find("/iree/compiler/");
+  if (at != llvm::StringRef::npos)
+    site = site.drop_front(at + 1);
+  return (llvm::Twine(site) + ":" + llvm::Twine(line)).str();
+}
 
 namespace mlir::iree_compiler {
 
@@ -185,12 +202,15 @@ public:
 /// "Vectorization"): the walk skipped this candidate before upstream
 /// vectorize() could speak. Costs a pointer check unless a remark engine
 /// is installed.
-static void declinedVectorization(Operation *op, const llvm::Twine &reason) {
+static void declinedVectorization(Operation *op, const llvm::Twine &reason,
+                                  const char *file = __builtin_FILE(),
+                                  unsigned line = __builtin_LINE()) {
   std::string text = reason.str();
   mlir::remark::missed(op, mlir::remark::RemarkOpts::name("vectorize")
                                    .category("Vectorization"))
       << mlir::remark::reason("{0}", text)
-      << mlir::remark::metric("op", op->getName().getStringRef());
+      << mlir::remark::metric("op", op->getName().getStringRef())
+      << mlir::remark::metric("site", statedSite(file, line));
 }
 
 void GenericVectorizationPass::runOnOperation() {

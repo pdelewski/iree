@@ -61,6 +61,22 @@
 
 #define DEBUG_TYPE "kernel-dispatch"
 
+/// The decision site's own address for the record, as `<path>:<line>` with
+/// the build path trimmed at the source-root marker so the same site reads
+/// the same on every machine (mlir-obs D1). Default arguments are evaluated
+/// at the CALLER: a helper that forwards its own defaulted file/line names
+/// the site that called it, an inline use names itself.
+static std::string statedSite(const char *file = __builtin_FILE(),
+                              unsigned line = __builtin_LINE()) {
+  llvm::StringRef site(file);
+  // find, not rfind: the tree can nest the marker twice, and the outer one
+  // is the path that resolves against a checkout root.
+  size_t at = site.find("/iree/compiler/");
+  if (at != llvm::StringRef::npos)
+    site = site.drop_front(at + 1);
+  return (llvm::Twine(site) + ":" + llvm::Twine(line)).str();
+}
+
 namespace mlir::iree_compiler {
 
 using CPUPipeline = IREE::CPU::LoweringPipeline;
@@ -4191,7 +4207,8 @@ lowerUsingDefaultPipeline(mlir::FunctionOpInterface entryPointFn) {
                      .category("LoweringConfig"))
       << remark::reason("no root operation identified; falling back to the "
                         "default pipeline (no tiling or vectorization "
-                        "strategy selected)");
+                        "strategy selected)")
+      << remark::metric("site", statedSite());
   return setTranslationInfo(entryPointFn, translationInfo);
 }
 
@@ -4314,7 +4331,8 @@ setTranslationInfoAndRootConfig(mlir::FunctionOpInterface entryPointFn,
         << remark::reason("pipeline {0} for root {1}", pipelineStr,
                           rootOperation->getName().getStringRef())
         << remark::metric("config", cfgStr)
-        << remark::metric("loopRanges", rangesStr);
+        << remark::metric("loopRanges", rangesStr)
+        << remark::metric("site", statedSite());
   }
 
   return success();
