@@ -34,6 +34,7 @@
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
@@ -1719,23 +1720,27 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
   // tile IS the cache tile; account for the (untiled) reduction extent
   // when sizing it. Only fires on static shapes whose working set
   // exceeds the budget — small-K contractions are untouched.
+  SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
+  int64_t kExtent = ranges.back();
+  unsigned mIdx = isBM ? 1 : 0;
+  unsigned nIdx = isBM ? 2 : 1;
+  bool staticMNK = !ShapedType::isDynamic(kExtent) && ranges.size() >= 2 &&
+                   !ShapedType::isDynamic(ranges[mIdx]) &&
+                   !ShapedType::isDynamic(ranges[nIdx]);
+  int64_t eltBytes =
+      std::max<int64_t>(1, lhsShapedType.getElementTypeBitWidth() / 8);
+  auto effTile = [&](unsigned idx) {
+    return distTileSizes[idx] == 0 ? ranges[idx] : distTileSizes[idx];
+  };
+  // Per-workgroup bytes of the lhs, rhs and result tiles at the full
+  // (untiled) reduction extent: what one workgroup streams.
+  auto workingSet = [&]() {
+    int64_t m = effTile(mIdx), n = effTile(nIdx);
+    return (m * kExtent + kExtent * n + m * n) * eltBytes;
+  };
+  bool workingSetBounded = false;
   if (clMatmulWorkingSetBudget > 0) {
-    SmallVector<int64_t> ranges = linalgOp.getStaticLoopRanges();
-    int64_t kExtent = ranges.back();
-    unsigned mIdx = isBM ? 1 : 0;
-    unsigned nIdx = isBM ? 2 : 1;
-    if (!ShapedType::isDynamic(kExtent) && ranges.size() >= 2 &&
-        !ShapedType::isDynamic(ranges[mIdx]) &&
-        !ShapedType::isDynamic(ranges[nIdx])) {
-      int64_t eltBytes =
-          std::max<int64_t>(1, lhsShapedType.getElementTypeBitWidth() / 8);
-      auto effTile = [&](unsigned idx) {
-        return distTileSizes[idx] == 0 ? ranges[idx] : distTileSizes[idx];
-      };
-      auto workingSet = [&]() {
-        int64_t m = effTile(mIdx), n = effTile(nIdx);
-        return (m * kExtent + kExtent * n + m * n) * eltBytes;
-      };
+    if (staticMNK) {
       auto minFor = [&](unsigned idx) {
         return distConfig.minTileSizes.empty()
                    ? 1
@@ -1754,10 +1759,54 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
             break;
         }
         distTileSizes[victim] = next;
+        workingSetBounded = true;
       }
       LDBG() << "Working-set bounded distribution tile sizes: "
              << distTileSizes;
     }
+  }
+
+  // mlir-obs (viewer-trust-plan.md D2): state what the distribution
+  // heuristic consulted, next to what it chose. `source` says whether the
+  // tile came from the default table (clDefaultDistTileSize, capped by the
+  // shape and the vector-size hints) or from the working-set bound above;
+  // `workingSetBytes` is the per-workgroup estimate the bound compares
+  // against the budget, and `defaultBudgetBytes` is the flag's own default
+  // so a record made with the bound switched off still carries the figure
+  // the compiler would have applied. Static shapes only: a dynamic extent has no
+  // working set to state, and the record says "dynamic" rather than guess.
+  // The target's cache sizes are not part of the executable target and so
+  // are not stated — a reader compares the working set with a machine
+  // figure they bring themselves.
+  {
+    std::string tilesStr;
+    {
+      llvm::raw_string_ostream os(tilesStr);
+      llvm::interleaveComma(distTileSizes, os);
+    }
+    remark::passed(linalgOp.getOperation(),
+                   remark::RemarkOpts::name("distribution-tile")
+                       .category("LoweringConfig"))
+        << remark::reason("distribution tile [{0}] from {1}", tilesStr,
+                          workingSetBounded ? "working-set bound"
+                                            : "default table")
+        << remark::metric("source", workingSetBounded ? "working-set-bound"
+                                                      : "default")
+        << remark::metric("workingSetBytes",
+                          staticMNK ? std::to_string(workingSet())
+                                    : std::string("dynamic"))
+        << remark::metric("budgetBytes",
+                          std::to_string(clMatmulWorkingSetBudget))
+        << remark::metric("defaultBudgetBytes",
+                          std::to_string(
+                              clMatmulWorkingSetBudget.getDefault().getValue()))
+        << remark::metric("defaultDistTile",
+                          std::to_string(clDefaultDistTileSize))
+        << remark::metric("vectorSize", std::to_string(vectorSize))
+        << remark::metric("nativeVectorBytes",
+                          std::to_string(
+                              getNativeVectorSizeInBytes(entryPointFn)))
+        << remark::metric("site", statedSite());
   }
 
   // TODO: We set cache tile sizes to the distribution sizes for now (no-op) to
