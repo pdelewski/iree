@@ -214,6 +214,30 @@ struct BubbleUpSetEncodingOp : OpRewritePattern<IREE::Encoding::SetEncodingOp> {
   }
 };
 
+/// Whether any operand is a tensor of a sub-byte element type.
+///
+/// Such a tensor is byte-per-element in a buffer but keeps its nominal
+/// width in the types the flow level hands to codegen, and the encoding
+/// path packs it with one view while the binding is sized with the other.
+/// Propagating an encoding onto one therefore produces a pack that is read
+/// back at the wrong offsets: an i1 attention mask makes GPT-2 return NaN,
+/// and a 256x256 `select` goes wrong from the first tile boundary, while
+/// the same program with a byte-wide mask is correct. Until i1 storage is
+/// consistent end to end, propagation declines these operands; the
+/// consumer then stays in the unpacked domain, which is where it runs
+/// without data tiling anyway.
+static bool hasSubByteTensorOperand(Operation *op) {
+  return llvm::any_of(op->getOperands(), [](Value operand) {
+    auto tensorType = dyn_cast<RankedTensorType>(operand.getType());
+    if (!tensorType) {
+      return false;
+    }
+    Type elementType = tensorType.getElementType();
+    return elementType.isIntOrFloat() &&
+           elementType.getIntOrFloatBitWidth() < 8;
+  });
+}
+
 /// Pattern to sink UnsetEncoding ops down through consumers.
 struct SinkUnsetEncodingOp : OpRewritePattern<IREE::Encoding::UnsetEncodingOp> {
   using Base::Base;
@@ -229,6 +253,11 @@ struct SinkUnsetEncodingOp : OpRewritePattern<IREE::Encoding::UnsetEncodingOp> {
         IREE::Flow::isNonNullAndOutsideDispatch(consumer)) {
       return rewriter.notifyMatchFailure(
           encodingOp, "expected that both operations are inside dispatch");
+    }
+    if (hasSubByteTensorOperand(consumer)) {
+      return rewriter.notifyMatchFailure(
+          encodingOp, "consumer reads a sub-byte tensor, whose packed layout "
+                      "would be read back at the wrong offsets");
     }
 
     auto propagationAttrInterface =
