@@ -123,6 +123,24 @@ static llvm::cl::opt<int64_t> clMatmulWorkingSetBudget(
                    "to bound contraction distribution tiles (0 = disabled)"),
     llvm::cl::init(196608));
 
+// mlir-obs iree-0012: a floor on how many workgroups a contraction's
+// distribution is allowed to leave. The default table sizes each parallel
+// dimension on its own, so a tile that meets the extent on all but one of
+// them leaves however many pieces that one dimension splits into, whatever
+// the machine has to run them on. GPT-2's att @ V (loop ranges
+// [128, 12, 64, 128], tile [16, 12, 64, 0]) leaves 8, and runs at 68
+// GFLOP/s beside its twin Q @ K^T, which gets 12 and runs at 315.
+//
+// Off by default (0 or 1 = today's behaviour): the useful floor is a
+// property of the host, which the compiler does not know, so this stays
+// opt-in until measured per target rather than becoming a silent guess.
+static llvm::cl::opt<int64_t> clMinDistributedWorkgroups(
+    "iree-llvmcpu-min-distributed-workgroups",
+    llvm::cl::desc("Split contraction distribution tiles further until they "
+                   "leave at least this many workgroups, budget permitting "
+                   "(0/1 = disabled)"),
+    llvm::cl::init(0));
+
 static llvm::cl::opt<int> clMatmulTileBytes(
     "iree-llvmcpu-matmul-tile-bytes",
     llvm::cl::desc(
@@ -1766,6 +1784,54 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
     }
   }
 
+  // mlir-obs iree-0012: raise the workgroup count when the chosen tiles
+  // leave too few. Splitting only ever shrinks a tile, so the working-set
+  // bound above cannot be violated by this loop; the floors are the same
+  // minimum tile sizes the default table respects. The victim is the
+  // largest divisible parallel tile, which is the dimension with the most
+  // to give.
+  bool minWorkgroupsSplit = false;
+  if (clMinDistributedWorkgroups > 1 && ranges.size() >= 2) {
+    unsigned numParallel = ranges.size() - 1; // the reduction is innermost
+    auto minFor = [&](unsigned idx) {
+      return distConfig.minTileSizes.empty()
+                 ? 1
+                 : std::max<int64_t>(1, distConfig.minTileSizes[idx]);
+    };
+    auto workgroups = [&]() -> int64_t {
+      int64_t n = 1;
+      for (unsigned i = 0; i < numParallel; ++i) {
+        if (ShapedType::isDynamic(ranges[i]))
+          return std::numeric_limits<int64_t>::max(); // unknown: leave alone
+        n *= llvm::divideCeil(ranges[i], effTile(i));
+      }
+      return n;
+    };
+    while (workgroups() < clMinDistributedWorkgroups) {
+      unsigned victim = numParallel;
+      int64_t best = 0;
+      for (unsigned i = 0; i < numParallel; ++i) {
+        int64_t cur = effTile(i);
+        if (cur <= minFor(i) || cur >= ranges[i] * 2)
+          continue;
+        if (std::max(minFor(i), cur / 2) == cur)
+          continue;
+        if (cur > best) {
+          best = cur;
+          victim = i;
+        }
+      }
+      if (victim == numParallel)
+        break; // nothing left to split
+      distTileSizes[victim] = std::max(minFor(victim), effTile(victim) / 2);
+      minWorkgroupsSplit = true;
+    }
+    if (minWorkgroupsSplit) {
+      LDBG() << "Min-workgroup split distribution tile sizes: "
+             << distTileSizes;
+    }
+  }
+
   // mlir-obs (viewer-trust-plan.md D2): state what the distribution
   // heuristic consulted, next to what it chose. `source` says whether the
   // tile came from the default table (clDefaultDistTileSize, capped by the
@@ -1788,10 +1854,14 @@ setContractionRootConfig(mlir::FunctionOpInterface entryPointFn,
                    remark::RemarkOpts::name("distribution-tile")
                        .category("LoweringConfig"))
         << remark::reason("distribution tile [{0}] from {1}", tilesStr,
-                          workingSetBounded ? "working-set bound"
-                                            : "default table")
-        << remark::metric("source", workingSetBounded ? "working-set-bound"
-                                                      : "default")
+                          minWorkgroupsSplit ? "min-workgroup split"
+                          : workingSetBounded ? "working-set bound"
+                                              : "default table")
+        << remark::metric("source", minWorkgroupsSplit ? "min-workgroups"
+                                    : workingSetBounded ? "working-set-bound"
+                                                        : "default")
+        << remark::metric("minWorkgroups",
+                          std::to_string(clMinDistributedWorkgroups))
         << remark::metric("workingSetBytes",
                           staticMNK ? std::to_string(workingSet())
                                     : std::string("dynamic"))
