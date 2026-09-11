@@ -9,11 +9,42 @@
 #include "iree/compiler/Dialect/Flow/IR/FlowDialect.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Twine.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
+#include "mlir/IR/Remarks.h"
 
 namespace mlir::iree_compiler::IREE::Flow {
+
+/// The decision site's own address for the record, as `<path>:<line>` with
+/// the build path trimmed at the source-root marker so the same site reads
+/// the same on every machine (mlir-obs D1). Default arguments are evaluated
+/// at the CALLER: a helper that forwards its own defaulted file/line names
+/// the site that called it, an inline use names itself.
+static std::string statedSite(const char *file = __builtin_FILE(),
+                              unsigned line = __builtin_LINE()) {
+  llvm::StringRef site(file);
+  size_t at = site.find("/iree/compiler/");
+  if (at != llvm::StringRef::npos)
+    site = site.drop_front(at + 1);
+  return (llvm::Twine(site) + ":" + llvm::Twine(line)).str();
+}
+
+/// Records a stated decline for a slice that could not become a flow
+/// metadata op, through mlir::remark (category "TensorToFlow"). The cost of
+/// this refusal is visible in every profile: the slice is wrapped in a
+/// dispatch of its own and runs as a copy kernel. Costs a pointer check
+/// unless a remark engine is installed on the context.
+static void declinedTensorToFlow(Operation *op, const llvm::Twine &reason,
+                                 const char *file = __builtin_FILE(),
+                                 unsigned line = __builtin_LINE()) {
+  mlir::remark::missed(op, mlir::remark::RemarkOpts::name("slice-to-flow")
+                               .category("TensorToFlow"))
+      << mlir::remark::reason("{0}", reason.str())
+      << mlir::remark::metric("op", op->getName().getStringRef())
+      << mlir::remark::metric("site", statedSite(file, line));
+}
 
 /// Gets the list of non-static values from a list of `OpFoldResult`.
 static SmallVector<Value>
@@ -138,6 +169,59 @@ bool isOffsetSizeAndStrideMappableToFlow(ArrayRef<OpFoldResult> offsets,
   return true;
 }
 
+/// Which condition of `isOffsetSizeAndStrideMappableToFlow` failed, in
+/// words. Diagnostic only: it mirrors that predicate's checks in the same
+/// order and is called only once the predicate has already returned false,
+/// so it changes no decision -- it only states one that was already taken.
+static std::string whyNotMappableToFlow(ArrayRef<OpFoldResult> offsets,
+                                        ArrayRef<OpFoldResult> sizes,
+                                        ArrayRef<OpFoldResult> strides,
+                                        ArrayRef<int64_t> baseShape) {
+  if (offsets.size() != baseShape.size()) {
+    return (llvm::Twine("rank-reducing slice: ") + llvm::Twine(offsets.size()) +
+            " offsets against a rank-" + llvm::Twine(baseShape.size()) +
+            " base, which flow's metadata ops do not express")
+        .str();
+  }
+  auto getVal = [](OpFoldResult valueOrAttr, int64_t dynamicVal) -> int64_t {
+    auto attr = dyn_cast<Attribute>(valueOrAttr);
+    return attr ? cast<IntegerAttr>(attr).getInt() : dynamicVal;
+  };
+  bool fullSlices = true;
+  for (size_t dim = offsets.size(); dim > 0; dim--) {
+    int64_t staticOffset = getVal(offsets[dim - 1], ShapedType::kDynamic);
+    int64_t staticSize = getVal(sizes[dim - 1], ShapedType::kDynamic);
+    int64_t staticStride = getVal(strides[dim - 1], ShapedType::kDynamic);
+    if (staticStride != 1) {
+      return (llvm::Twine("stride ") + llvm::Twine(staticStride) +
+              " on dimension " + llvm::Twine(dim - 1) +
+              "; a flow metadata op describes contiguous ranges only")
+          .str();
+    }
+    if (!fullSlices) {
+      if (staticSize != 1) {
+        return (llvm::Twine("non-contiguous slice: dimension ") +
+                llvm::Twine(dim - 1) + " takes " + llvm::Twine(staticSize) +
+                " elements while an inner dimension is already partial, so "
+                "the selected elements are not one range")
+            .str();
+      }
+    } else if (!(staticOffset == 0 && ShapedType::isStatic(staticSize) &&
+                 ShapedType::isStatic(baseShape[dim - 1]) &&
+                 staticSize == baseShape[dim - 1])) {
+      fullSlices = false;
+    }
+  }
+  for (auto [offset, size, stride] : llvm::zip_equal(offsets, sizes, strides)) {
+    if (producedByValueExtract(offset) || producedByValueExtract(size) ||
+        producedByValueExtract(stride)) {
+      return "a dynamic offset/size/stride is extracted from a tensor, so "
+             "mapping it to flow would round-trip the value through the host";
+    }
+  }
+  return "offsets/sizes/strides do not map to a flow metadata op";
+}
+
 LogicalResult
 convertInsertSliceOpToFlowUpdateOp(RewriterBase &rewriter,
                                    tensor::InsertSliceOp insertOp) {
@@ -153,6 +237,9 @@ convertInsertSliceOpToFlowUpdateOp(RewriterBase &rewriter,
   SmallVector<OpFoldResult> strides = insertOp.getMixedStrides();
   ArrayRef<int64_t> dstShape = insertOp.getType().getShape();
   if (!isOffsetSizeAndStrideMappableToFlow(offsets, sizes, strides, dstShape)) {
+    declinedTensorToFlow(insertOp,
+                         whyNotMappableToFlow(offsets, sizes, strides,
+                                              dstShape));
     return failure();
   }
 
@@ -198,6 +285,9 @@ convertExtractSliceOpToFlowSliceOp(RewriterBase &rewriter,
   SmallVector<OpFoldResult> strides = sliceOp.getMixedStrides();
   ArrayRef<int64_t> srcShape = sliceOp.getSourceType().getShape();
   if (!isOffsetSizeAndStrideMappableToFlow(offsets, sizes, strides, srcShape)) {
+    declinedTensorToFlow(sliceOp,
+                         whyNotMappableToFlow(offsets, sizes, strides,
+                                              srcShape));
     return failure();
   }
 
