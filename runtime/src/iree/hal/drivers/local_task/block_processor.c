@@ -781,6 +781,11 @@ static iree_status_t iree_hal_cmd_execute_dispatch_tiles(
   if (worker_count == 1) {
     IREE_TRACE_ZONE_BEGIN_NAMED_DYNAMIC(z_dispatch, trace_name.data,
                                         trace_name.size);
+    // The export ordinal rides with the zone so a consumer can join the slice
+    // to its executable without the debug-level-3 name (mlir-obs provider).
+    IREE_TRACE_ZONE_APPEND_VALUE_I64(z_dispatch,
+                                     (int64_t)dispatch->export_ordinal);
+    IREE_TRACE_ZONE_APPEND_VALUE_I64(z_dispatch, (int64_t)tile_count);
 
     // Single-worker fast path: no tile claiming atomics needed.
     for (uint32_t tile = 0; tile < tile_count; ++tile) {
@@ -828,6 +833,12 @@ static iree_status_t iree_hal_cmd_execute_dispatch_tiles(
 
       IREE_TRACE_ZONE_BEGIN_NAMED_DYNAMIC(z_dispatch, trace_name.data,
                                           trace_name.size);
+      IREE_TRACE_ZONE_APPEND_VALUE_I64(z_dispatch,
+                                       (int64_t)dispatch->export_ordinal);
+      // The workgroups this claim covers (the reservation, or the shorter
+      // tail of the grid): the mlir-obs provider records it per range.
+      IREE_TRACE_ZONE_APPEND_VALUE_I64(z_dispatch,
+                                       (int64_t)(new_counter - counter));
 
       for (uint32_t tile = counter; tile < new_counter; ++tile) {
         iree_hal_executable_workgroup_state_v0_t workgroup_state;

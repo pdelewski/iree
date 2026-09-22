@@ -25,6 +25,23 @@ if(${IREE_TRACING_PROVIDER} STREQUAL "console")
       "IREE_TRACING_MODE=${IREE_TRACING_MODE}"
     PUBLIC
   )
+elseif(${IREE_TRACING_PROVIDER} STREQUAL "mlirobs")
+  # mlir-obs: zones as JSONL run-sidecar records (docs/tracy-parity-plan.md).
+  iree_cc_library(
+    NAME
+      provider
+    HDRS
+      "mlirobs.h"
+    SRCS
+      "mlirobs.c"
+    DEPS
+      iree::base::core_headers
+      iree::base::internal::time
+    DEFINES
+      "IREE_TRACING_PROVIDER_H=\"iree/base/tracing/mlirobs.h\""
+      "IREE_TRACING_MODE=${IREE_TRACING_MODE}"
+    PUBLIC
+  )
 elseif(${IREE_TRACING_PROVIDER} STREQUAL "tracy")
   iree_cc_library(
     NAME
